@@ -1,0 +1,36 @@
+# Virtualenv
+.venv/
+
+# Saved login session and credentials
+# (stored in ~/.config/zoomdownloader/ – not in the project tree)
+
+# Scraped index & downloaded patches (user-generated data)
+index/*.json
+downloads/*.zg*
+downloads/*.zg3
+downloads/*.zg3x
+downloads/*.zg5
+
+debug
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
