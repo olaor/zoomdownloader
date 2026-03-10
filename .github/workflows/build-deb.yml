@@ -1,0 +1,80 @@
+name: Build & publish
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: ver
+        run: echo "version=1.0.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── .deb ──────────────────────────────────────────────────────────────
+      - name: Build .deb
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          PKG=pkg
+          LIBDIR=/usr/lib/zoomdownloader
+
+          mkdir -p "$PKG/DEBIAN"
+          mkdir -p "$PKG/usr/bin"
+          mkdir -p "$PKG$LIBDIR"
+
+          MAINTAINER="$(git log -1 --pretty=format:'%an <%ae>')"
+          sed "s/DEB_VERSION/${VERSION}/; s/DEB_MAINTAINER/${MAINTAINER}/" \
+            debian/control > "$PKG/DEBIAN/control"
+
+          install -m 755 bin/zoomdownloader "$PKG/usr/bin/zoomdownloader"
+
+          cp main.py scraper.py viewer.py zoom_midi.py requirements.txt \
+            "$PKG$LIBDIR/"
+
+          dpkg-deb --root-owner-group --build "$PKG" \
+            "zoomdownloader_${VERSION}_all.deb"
+
+      # ── pip wheel ─────────────────────────────────────────────────────────
+      - name: Build pip package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          pip install --quiet build
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          python -m build
+
+      # ── GitHub release ────────────────────────────────────────────────────
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          make_latest: true
+          files: |
+            *.deb
+            dist/*.whl
+            dist/*.tar.gz
+
+      # ── PyPI ──────────────────────────────────────────────────────────────
+      # Requires a PYPI_API_TOKEN repository secret.
+      # Create a token at https://pypi.org/manage/account/token/ then add it in
+      # Settings → Secrets and variables → Actions → New repository secret.
+      - name: Publish to PyPI
+        if: ${{ secrets.PYPI_API_TOKEN != '' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

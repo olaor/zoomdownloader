@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Launcher installed by the .deb package.
+# Creates a per-user venv on first run, installs Python dependencies,
+# then delegates to the installed Python application.
+set -euo pipefail
+
+INSTALL_DIR="/usr/lib/zoomdownloader"
+VENV="${XDG_DATA_HOME:-$HOME/.local/share}/zoomdownloader/.venv"
+
+if [[ ! -x "$VENV/bin/python" ]]; then
+    echo "Creating virtual environment…"
+    mkdir -p "$(dirname "$VENV")"
+    python3 -m venv "$VENV"
+fi
+
+MARKER="$VENV/.deps_installed"
+if [[ ! -f "$MARKER" || "$INSTALL_DIR/requirements.txt" -nt "$MARKER" ]]; then
+    echo "Installing dependencies…"
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    "$VENV/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
+    touch "$MARKER"
+fi
+
+exec "$VENV/bin/python" "$INSTALL_DIR/main.py" "$@"

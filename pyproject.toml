@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "zoomdownloader"
+version = "1.0.0"          # overridden by CI
+description = "Scrape & browse Tonelib G3n/G3Xn/G5n guitar patches"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["zoom", "guitar", "patches", "tonelib", "midi"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Environment :: Console",
+]
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "textual>=0.52.0",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+zoomdownloader = "main:main"
+
+[tool.setuptools]
+py-modules = ["main", "scraper", "viewer", "zoom_midi"]

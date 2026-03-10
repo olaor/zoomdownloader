@@ -1,0 +1,9 @@
+Package: zoomdownloader
+Version: DEB_VERSION
+Architecture: all
+Maintainer: DEB_MAINTAINER
+Depends: python3 (>= 3.10), python3-venv
+Description: Tonelib forum patch scraper & TUI browser
+ Scrapes and browses Zoom G3n / G3Xn / G5n guitar patches
+ from the Tonelib community forum. Supports uploading patches
+ directly to the pedal via USB/MIDI SysEx.
