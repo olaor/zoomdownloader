@@ -29,8 +29,9 @@ from textual.widgets import (
 )
 
 BASE_DIR     = Path(__file__).parent
-INDEX_DIR    = BASE_DIR / "index"
-DOWNLOAD_DIR = BASE_DIR / "downloads"
+APP_DIR      = Path.home() / ".zoomdownloader"
+INDEX_DIR    = APP_DIR / "index"
+DOWNLOAD_DIR = APP_DIR / "downloads"
 DEBUG_DIR    = BASE_DIR / "debug"
 
 log = logging.getLogger("zoomdownloader.browse")

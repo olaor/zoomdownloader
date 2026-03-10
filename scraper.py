@@ -31,10 +31,11 @@ FORUM_PATH = "/forums/zoom-g3n-g3xn-g5n.15/"
 FORUM_URL  = BASE_URL + FORUM_PATH
 
 BASE_DIR          = Path(__file__).parent
-INDEX_DIR         = BASE_DIR / "index"
+APP_DIR           = Path.home() / ".zoomdownloader"
+INDEX_DIR         = APP_DIR / "index"
 DEBUG_DIR         = BASE_DIR / "debug"
 
-CONFIG_DIR        = Path.home() / ".config" / "zoomdownloader"
+CONFIG_DIR        = APP_DIR / "config"
 COOKIES_FILE      = CONFIG_DIR / "cookies.json"
 CREDENTIALS_FILE  = CONFIG_DIR / "credentials.json"
 
@@ -456,7 +457,7 @@ class ForumScraper:
             f"\n[bold green]Done![/bold green] "
             f"Indexed [cyan]{total_indexed}[/cyan] new  •  "
             f"skipped [dim]{total_skipped}[/dim] already indexed  •  "
-            f"JSON files in [cyan]{INDEX_DIR.relative_to(BASE_DIR)}[/cyan]"
+            f"JSON files in [cyan]{INDEX_DIR}[/cyan]"
         )
 
     # ── file download (used by viewer) ───────────────────────────────────────
