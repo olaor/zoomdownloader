@@ -311,6 +311,11 @@ class ZoomDevice:
         """Request and return the current edit-buffer patch as raw PTCF."""
         self._write(self._sysex(CMD_REQUEST_CURRENT_PATCH))
         resp = self._read(timeout=3.0)
+        # The pedal sometimes sends a short generic ACK (7 bytes) first and
+        # then the actual patch data as a second SysEx message.  Read again.
+        if len(resp) < 10:
+            log.debug("read_current_patch: got short ACK, reading again")
+            resp = self._read(timeout=3.0)
         if len(resp) < 10:
             raise RuntimeError(f"Short response reading current patch: {len(resp)} bytes")
         # Response: F0 52 00 6E 28 <encoded_data> F7
@@ -358,6 +363,42 @@ class ZoomDevice:
             )
         log.debug("pc_mode_on: OK (%d bytes)", len(resp))
         return resp
+
+    def parse_current_slot(self, pc_resp: bytes) -> int | None:
+        """
+        Try to extract the currently-active slot from a pc_mode_on() response.
+
+        The G3n/G3Xn PC-mode-ON SysEx reply embeds the memory layout (same
+        fields as patch_check) followed by the current bank and location:
+          d[4..5]  = count  (7-bit lo/hi)
+          d[6..7]  = psize
+          d[10..11]= bsize
+          d[12..13]= current bank (lo/hi)
+          d[14..15]= current location within bank (lo/hi)
+
+        Returns the 0-based slot index, or None if the response is too short
+        or the computed slot falls outside the valid range.
+        """
+        d = pc_resp[1:-1]  # strip F0 / F7
+        log.debug("parse_current_slot: resp=%d bytes  hex=%s",
+                  len(d), pc_resp[:24].hex(" "))
+        if len(d) < 16:
+            log.warning("parse_current_slot: response too short (%d bytes) — "
+                        "cannot determine current slot", len(d))
+            return None
+        count = d[4] + d[5] * 128 or 150
+        bsize = d[10] + d[11] * 128 or 3
+        bank  = d[12] + d[13] * 128
+        loc   = d[14] + d[15] * 128
+        slot  = bank * bsize + loc
+        if not (0 <= slot < count):
+            log.warning("parse_current_slot: slot=%d out of range 0\u2013%d "
+                        "(bank=%d loc=%d bsize=%d count=%d)",
+                        slot, count - 1, bank, loc, bsize, count)
+            return None
+        log.info("parse_current_slot: slot=%d (bank=%d loc=%d bsize=%d)",
+                 slot, bank, loc, bsize)
+        return slot
 
     def pc_mode_off(self) -> None:
         """Disable PC mode."""

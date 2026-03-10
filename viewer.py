@@ -67,6 +67,7 @@ class DetailScreen(Screen):
         Binding("escape,q", "dismiss", "Back"),
         Binding("d", "download", "Download patch"),
         Binding("u", "upload_to_pedal", "Upload to pedal"),
+        Binding("t", "test_patch", "Test patch"),
     ]
 
     DEFAULT_CSS = """
@@ -147,6 +148,15 @@ class DetailScreen(Screen):
         title = _field(self.patch, "title", "patch")
         log.debug("DetailScreen.action_upload_to_pedal: title=%r url=%s", title, urls[0])
         self.app.start_upload_flow(urls[0], self.patch)
+
+    def action_test_patch(self) -> None:
+        urls = self.patch.get("download_urls", [])
+        if not urls:
+            self.notify("No download URL available for this patch.", severity="warning")
+            return
+        title = _field(self.patch, "title", "patch")
+        log.debug("DetailScreen.action_test_patch: title=%r url=%s", title, urls[0])
+        self.app.start_test_flow(urls[0], self.patch)
 
 
 # ── Download-choice modal (for multiple URLs) ─────────────────────────────────
@@ -245,6 +255,72 @@ class SlotInputModal(ModalScreen[int | None]):
         self.dismiss(None)
 
 
+class TestPatchConfirmModal(ModalScreen[bool]):
+    """Ask user whether to keep a temporarily-loaded test patch in its slot."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("y", "confirm_keep", "Keep", show=False),
+        Binding("n", "discard", "Discard", show=False),
+        Binding("escape", "discard", "Discard"),
+        Binding("q", "discard", "Discard", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    TestPatchConfirmModal {
+        align: center middle;
+    }
+    #test-box {
+        width: 62;
+        height: auto;
+        border: thick $success;
+        background: $surface;
+        padding: 1 2;
+    }
+    #test-box Label {
+        margin-bottom: 1;
+    }
+    #test-buttons {
+        height: auto;
+    }
+    #test-keep {
+        width: 1fr;
+    }
+    #test-discard {
+        width: 1fr;
+    }
+    """
+
+    def __init__(self, patch_name: str) -> None:
+        super().__init__()
+        self.patch_name = patch_name
+
+    def compose(self) -> ComposeResult:
+        with Container(id="test-box"):
+            yield Label(
+                f'[bold green]"{self.patch_name}"[/bold green] is now active on your pedal.\n'
+                "Keep it?",
+                markup=True,
+            )
+            with Horizontal(id="test-buttons"):
+                yield Button("[Y] Keep", id="test-keep", variant="success")
+                yield Button("[N/Esc/Q] Discard", id="test-discard", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "test-keep":
+            self.action_confirm_keep()
+        else:
+            self.action_discard()
+
+    def action_confirm_keep(self) -> None:
+        self.dismiss(True)
+
+    def action_discard(self) -> None:
+        self.dismiss(False)
+
+    def on_mount(self) -> None:
+        self.query_one("#test-discard", Button).focus()
+
+
 class PatchFileChoiceModal(ModalScreen["list[Path] | None"]):
     """Pick one patch file or upload all."""
 
@@ -322,6 +398,7 @@ class BrowserScreen(Screen):
         Binding("enter", "view_detail", "Details", show=True),
         Binding("d", "download_selected", "Download", show=True),
         Binding("u", "upload_selected", "Upload to pedal", show=True),
+        Binding("t", "test_selected", "Test patch", show=True),
         Binding("r", "reload", "Reload index", show=True),
     ]
 
@@ -479,6 +556,26 @@ class BrowserScreen(Screen):
             def _on_pick(idx: int | None) -> None:
                 if idx is not None:
                     self.app.start_upload_flow(urls[idx], patch)
+
+            self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
+
+    def action_test_selected(self) -> None:
+        patch = self._selected_patch()
+        if patch is None:
+            log.debug("action_test_selected: no patch selected")
+            return
+        urls = patch.get("download_urls", [])
+        if not urls:
+            self.notify("No download URL for this patch.", severity="warning")
+            return
+        title = _field(patch, "title", "patch")
+        log.debug("action_test_selected: title=%r urls=%d", title, len(urls))
+        if len(urls) == 1:
+            self.app.start_test_flow(urls[0], patch)
+        else:
+            def _on_pick(idx: int | None) -> None:
+                if idx is not None:
+                    self.app.start_test_flow(urls[idx], patch)
 
             self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
 
@@ -782,6 +879,223 @@ class ZoomPatchBrowser(App):
                 self.notify,
                 f"Failed: {exc}",
                 title="Upload error",
+                severity="error",
+                timeout=15,
+            )
+
+    # ── test-patch orchestration ──────────────────────────────────────────────
+
+    def start_test_flow(self, url: str, patch: dict) -> None:
+        """Download the patch then ask for a slot to test it on."""
+        title = _field(patch, "title", "patch")
+        log.info("start_test_flow: url=%s title=%r", url, title)
+        self._do_test_download(url, patch)
+
+    @work(thread=True)
+    def _do_test_download(self, url: str, patch: dict) -> None:
+        """Background worker: download patch then hand off to file-picker / slot prompt."""
+        from scraper import ForumScraper
+
+        title = _field(patch, "title", "patch")
+        dest_dir = self._patch_dir(patch)
+
+        self.call_from_thread(
+            self.notify, f"Downloading \u2018{title}\u2019\u2026", title="Test patch", timeout=8,
+        )
+
+        scraper = ForumScraper()
+        scraper.load_cookies()
+
+        try:
+            scraper.download_file(url, dest_dir, title=title)
+            self._extract_archives(dest_dir)
+            patch_files = self._find_patch_files(dest_dir)
+            log.info("test-dl: found %d patch file(s)", len(patch_files))
+
+            if not patch_files:
+                contents = list(dest_dir.rglob("*"))
+                self.call_from_thread(
+                    self.notify,
+                    f"No patch files found. Contents: {[c.name for c in contents[:10]]}",
+                    title="Test patch error",
+                    severity="error",
+                    timeout=10,
+                )
+                return
+
+            self.call_from_thread(self._test_pick_file, patch_files, title)
+
+        except Exception as exc:
+            log.exception("test-dl: FAILED")
+            self.call_from_thread(
+                self.notify,
+                f"Download failed: {exc}",
+                title="Test patch error",
+                severity="error",
+                timeout=15,
+            )
+
+    def _test_pick_file(self, patch_files: list[Path], title: str) -> None:
+        """For one file go straight to pedal; for multiple show the file picker."""
+        if len(patch_files) == 1:
+            self._do_test_patch_load(patch_files[0], title)
+            return
+
+        def _on_choice(chosen: "list[Path] | None") -> None:
+            if chosen:
+                self._do_test_patch_load(chosen[0], title)
+
+        self.push_screen(PatchFileChoiceModal(patch_files), callback=_on_choice)
+
+    @work(thread=True)
+    def _do_test_patch_load(self, patch_file: Path, title: str) -> None:
+        """
+        Background worker: enter editor mode, backup the current edit buffer,
+        send the test patch to the edit buffer (volatile — no slot written),
+        then leave the device open in editor mode so the pedal keeps playing it.
+        """
+        from zoom_midi import ZoomDevice, parse_patch_file
+
+        self.call_from_thread(
+            self.notify,
+            f"Loading \u2018{title}\u2019 for testing\u2026",
+            title="Test patch",
+            timeout=8,
+        )
+
+        try:
+            ptcf_data = parse_patch_file(patch_file)
+            name_bytes = ptcf_data[26:37]
+            patch_name = (
+                bytes(b for b in name_bytes if 0x20 <= b <= 0x7E)
+                .decode("ascii", errors="replace")
+                .strip()
+            ) or title
+
+            backup_ptcf: bytes | None = None
+            with ZoomDevice(debug=self._debug_mode) as dev:
+                dev.editor_mode_on()
+                try:
+                    backup_ptcf = dev.read_current_patch()
+                    log.debug("test-load: backup read OK (%d bytes)", len(backup_ptcf))
+                except Exception as exc:
+                    log.warning("test-load: backup read failed (restore unavailable): %s", exc)
+                dev.send_patch_to_current(ptcf_data)
+                # Intentionally leave editor mode ON so the test patch stays
+                # active on the pedal while the user listens and decides.
+
+            self.call_from_thread(
+                self._test_show_confirm, backup_ptcf, patch_file, title, patch_name
+            )
+
+        except Exception as exc:
+            log.exception("test-load: FAILED")
+            self.call_from_thread(
+                self.notify,
+                f"Failed to load test patch: {exc}",
+                title="Test patch error",
+                severity="error",
+                timeout=15,
+            )
+
+    def _test_show_confirm(
+        self,
+        backup_ptcf: "bytes | None",
+        patch_file: Path,
+        title: str,
+        patch_name: str,
+    ) -> None:
+        """Main-thread: show keep/discard confirmation modal."""
+
+        def _on_result(keep: bool) -> None:
+            if keep:
+                self._test_ask_slot_and_save(patch_file, title, backup_ptcf)
+            else:
+                self._do_test_patch_restore(backup_ptcf, title)
+
+        self.push_screen(TestPatchConfirmModal(patch_name), callback=_on_result)
+
+    def _test_ask_slot_and_save(
+        self, patch_file: Path, title: str, backup_ptcf: "bytes | None"
+    ) -> None:
+        """Ask for a slot then permanently save; cancel restores the backup."""
+
+        def _on_slot(slot: "int | None") -> None:
+            if slot is not None:
+                self._do_test_patch_save(patch_file, title, slot - 1)  # 1-based \u2192 0-based
+            else:
+                # User cancelled the slot dialog — treat as discard
+                self._do_test_patch_restore(backup_ptcf, title)
+
+        self.push_screen(SlotInputModal(), callback=_on_slot)
+
+    @work(thread=True)
+    def _do_test_patch_save(self, patch_file: Path, title: str, slot: int) -> None:
+        """Background worker: permanently write the test patch to *slot* via PC mode."""
+        from zoom_midi import ZoomDevice
+
+        self.call_from_thread(
+            self.notify,
+            f"Saving \u2018{title}\u2019 to slot {slot + 1}\u2026",
+            title="Test patch",
+            timeout=8,
+        )
+
+        try:
+            with ZoomDevice(debug=self._debug_mode) as dev:
+                name = dev.upload_patch(patch_file, slot)
+            self.call_from_thread(
+                self.notify,
+                f"\u2018{name}\u2019 saved to slot {slot + 1}.",
+                title="Patch saved",
+                timeout=8,
+            )
+        except Exception as exc:
+            log.exception("test-save: FAILED")
+            self.call_from_thread(
+                self.notify,
+                f"Save failed: {exc}",
+                title="Test patch error",
+                severity="error",
+                timeout=15,
+            )
+
+    @work(thread=True)
+    def _do_test_patch_restore(self, backup_ptcf: "bytes | None", title: str) -> None:
+        """Background worker: restore the edit buffer to its pre-test state."""
+        from zoom_midi import ZoomDevice
+
+        if backup_ptcf is None:
+            self.call_from_thread(
+                self.notify,
+                "Test discarded. (Backup unavailable \u2014 navigate away and back on the pedal to reload the original.)",
+                title="Test patch",
+                severity="warning",
+                timeout=10,
+            )
+            return
+
+        try:
+            with ZoomDevice(debug=self._debug_mode) as dev:
+                dev.editor_mode_on()
+                dev.send_patch_to_current(backup_ptcf)
+                # Do NOT call editor_mode_off() here.
+                # The pedal auto-saves the edit buffer to the current slot when
+                # the MIDI connection is closed without an explicit editor-off
+                # command, which is exactly what we want: the backup overwrites
+                # the test patch that was auto-saved when we loaded it.
+            self.call_from_thread(
+                self.notify,
+                "Test discarded \u2014 original patch restored.",
+                title="Test patch",
+                timeout=5,
+            )
+        except Exception as exc:
+            log.exception("test-restore: FAILED")
+            self.call_from_thread(
+                self.notify,
+                f"Restore failed: {exc}",
+                title="Test patch error",
                 severity="error",
                 timeout=15,
             )
