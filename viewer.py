@@ -322,7 +322,7 @@ class BrowserScreen(Screen):
         Binding("enter", "view_detail", "Details", show=True),
         Binding("d", "download_selected", "Download", show=True),
         Binding("u", "upload_selected", "Upload to pedal", show=True),
-        Binding("r", "reload", "Reload index", show=False),
+        Binding("r", "reload", "Reload index", show=True),
     ]
 
     DEFAULT_CSS = """
