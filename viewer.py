@@ -226,17 +226,17 @@ class SlotInputModal(ModalScreen[int | None]):
     def compose(self) -> ComposeResult:
         with Container(id="slot-box"):
             yield Label("[bold]Upload to pedal slot:[/bold]", markup=True)
-            yield Input(placeholder="Slot number (0–199)", id="slot-input", type="integer")
+            yield Input(placeholder="Slot number (1–200)", id="slot-input", type="integer")
             yield Button("Upload", id="slot-ok", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         val = self.query_one("#slot-input", Input).value.strip()
         if val.isdigit():
             slot = int(val)
-            if 0 <= slot <= 199:
+            if 1 <= slot <= 200:
                 self.dismiss(slot)
                 return
-        self.notify("Enter a slot number between 0 and 199.", severity="warning")
+        self.notify("Enter a slot number between 1 and 200.", severity="warning")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.on_button_pressed(Button.Pressed(self.query_one("#slot-ok", Button)))
@@ -743,8 +743,9 @@ class ZoomPatchBrowser(App):
         def _on_slot(slot: int | None) -> None:
             if slot is not None:
                 for i, pf in enumerate(patch_files):
+                    internal_slot = slot - 1 + i  # user sees 1-based, pedal uses 0-based
                     log.debug("_upload_ask_slot._on_slot: slot=%r file=%s", slot + i, pf.name)
-                    self._do_upload_send(pf, title, slot + i)
+                    self._do_upload_send(pf, title, internal_slot)
 
         self.push_screen(SlotInputModal(), callback=_on_slot)
 
