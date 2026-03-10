@@ -69,12 +69,4 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
 
-      # ── PyPI ──────────────────────────────────────────────────────────────
-      # Requires a PYPI_API_TOKEN repository secret.
-      # Create a token at https://pypi.org/manage/account/token/ then add it in
-      # Settings → Secrets and variables → Actions → New repository secret.
-      - name: Publish to PyPI
-        if: ${{ secrets.PYPI_API_TOKEN != '' }}
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+
