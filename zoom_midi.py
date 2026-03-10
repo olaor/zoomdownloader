@@ -109,24 +109,33 @@ def _parse_tonelib_xml(xml_data: bytes, source: str = "<unknown>") -> bytes:
 def parse_patch_file(path: str | Path) -> bytes:
     """
     Extract raw PTCF bytes from a .zg3xn / .zg3n / .zg5n file,
-    or from a raw ToneLib.data XML file.
+    or from a raw ToneLib.data XML file, or a bare PTCF binary.
 
-    .zg* file format:
-      - 4-byte header (byte 0 = model ID, e.g. 0x6E)
-      - Followed by a ZIP archive containing ToneLib.data (XML)
-      - XML <data dump="hex,hex,..."/> holds the PTCF payload
+    Supported formats:
+      - Raw PTCF binary (starts with b"PTCF") — returned as-is
+      - XML ToneLib.data — parsed directly
+      - .zg* container: arbitrary header + embedded ZIP containing ToneLib.data
     """
     path = Path(path)
     raw = path.read_bytes()
+
+    # Already a raw PTCF binary — return as-is
+    if raw[:4] == b"PTCF":
+        return raw
 
     # If the file looks like XML, parse directly
     stripped = raw.lstrip()
     if stripped[:1] == b"<" or stripped[:5] == b"<?xml":
         return _parse_tonelib_xml(raw, str(path))
 
-    # Otherwise treat as .zg* format: skip the 4-byte header to get the ZIP
-    zip_data = raw[4:]
-    with zipfile.ZipFile(BytesIO(zip_data)) as zf:
+    # .zg* format: locate the embedded ZIP by its magic bytes (PK\x03\x04)
+    # rather than assuming a fixed header length.
+    zip_offset = raw.find(b"PK\x03\x04")
+    if zip_offset == -1:
+        raise ValueError(
+            f"No ZIP data found in {path} — unsupported .zg* format"
+        )
+    with zipfile.ZipFile(BytesIO(raw[zip_offset:])) as zf:
         xml_data = zf.read("ToneLib.data")
 
     return _parse_tonelib_xml(xml_data, str(path))
@@ -207,6 +216,7 @@ class ZoomDevice:
             )
         log.debug("MIDI open %s", self.device_path)
         self._fd = os.open(self.device_path, os.O_RDWR | os.O_NONBLOCK)
+        self._drain()
 
     def close(self) -> None:
         if self._fd is not None:
@@ -219,6 +229,23 @@ class ZoomDevice:
 
     def __exit__(self, *exc):
         self.close()
+
+    def _drain(self) -> None:
+        """Discard any stale bytes sitting in the RX buffer."""
+        import select
+        if self._fd is None:
+            return
+        drained = 0
+        while True:
+            rlist, _, _ = select.select([self._fd], [], [], 0)
+            if not rlist:
+                break
+            chunk = os.read(self._fd, 4096)
+            if not chunk:
+                break
+            drained += len(chunk)
+        if drained:
+            log.debug("_drain: discarded %d stale byte(s)", drained)
 
     def _write(self, data: bytes | bytearray | list) -> None:
         if self._fd is None:
@@ -312,6 +339,14 @@ class ZoomDevice:
 
     def pc_mode_on(self) -> bytes:
         """Enable PC mode (required for persistent patch read/write)."""
+        # Normalise: send pc_mode_off first in case the pedal is already in PC
+        # mode (e.g. from a previous failed session), then wait for its ACK so
+        # it doesn't collide with the pc_mode_on response below.
+        log.debug("pc_mode_on: normalising with CMD_PC_MODE_OFF (0x%02X)", CMD_PC_MODE_OFF)
+        self._write(self._sysex(CMD_PC_MODE_OFF))
+        self._read(timeout=0.3)   # consume ACK or silently time out
+        self._drain()             # clear any residual bytes
+
         log.debug("pc_mode_on: sending CMD_PC_MODE_ON (0x%02X)", CMD_PC_MODE_ON)
         self._write(self._sysex(CMD_PC_MODE_ON))
         resp = self._read(timeout=2.0)
@@ -346,7 +381,15 @@ class ZoomDevice:
         # mido-style offsets (skip F0): [4]=count_lo, [5]=count_hi, etc.
         d = resp[1:-1]  # strip F0 and F7
         if len(d) < 12:
-            raise RuntimeError(f"Short patch_check response: {len(resp)} bytes")
+            # Device sent a short generic ACK instead of the detailed layout
+            # response.  Fall back to known constants for G3n/G3Xn/G5n.
+            count, psize, bsize = 150, PTCF_SIZE, 3
+            log.warning(
+                "patch_check: short response (%d bytes), using defaults "
+                "count=%d psize=%d bsize=%d",
+                len(resp), count, psize, bsize,
+            )
+            return count, psize, bsize
         count = d[4] + d[5] * 128
         psize = d[6] + d[7] * 128
         bsize = d[10] + d[11] * 128
@@ -422,18 +465,16 @@ class ZoomDevice:
         log.debug("upload_patch: parsed PTCF — %d bytes, header: %s",
                   len(ptcf_data), ptcf_data[:8].hex(" "))
 
-        if len(ptcf_data) != PTCF_SIZE:
-            raise ValueError(
-                f"Unexpected PTCF size: {len(ptcf_data)} (expected {PTCF_SIZE})"
-            )
-
         name_bytes = ptcf_data[26:37]
-        name = bytes(b for b in name_bytes if b >= 0x20 and b <= 0x7E).decode("ascii", errors="replace").strip()
+        name = bytes(b for b in name_bytes if 0x20 <= b <= 0x7E).decode("ascii", errors="replace").strip()
         log.info("upload_patch: patch name = %r", name)
 
         self.pc_mode_on()
         try:
-            _count, _psize, bsize = self.patch_check()
+            _count, psize, bsize = self.patch_check()
+            if len(ptcf_data) < psize:
+                ptcf_data = ptcf_data + b"\x00" * (psize - len(ptcf_data))
+                log.debug("upload_patch: padded PTCF to %d bytes", psize)
             self.write_patch_to_slot(slot, ptcf_data, bsize)
         finally:
             self.pc_mode_off()

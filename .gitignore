@@ -6,10 +6,7 @@
 
 # Scraped index & downloaded patches (user-generated data)
 index/*.json
-downloads/*.zg*
-downloads/*.zg3
-downloads/*.zg3x
-downloads/*.zg5
+downloads/*/*
 
 debug
 

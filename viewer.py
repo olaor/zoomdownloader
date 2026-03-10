@@ -24,6 +24,7 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    OptionList,
     Static,
 )
 
@@ -45,6 +46,7 @@ def load_patches() -> list[dict]:
         try:
             data = json.loads(p.read_text())
             data["_file"] = p.name
+            data["_id"] = p.stem        # e.g. "18732"
             patches.append(data)
         except Exception:
             pass
@@ -135,8 +137,7 @@ class DetailScreen(Screen):
         if not urls:
             self.notify("No download URL available for this patch.", severity="warning")
             return
-        title = _field(self.patch, "title", "patch")
-        self.app.trigger_download(urls[0], title)
+        self.app.trigger_download(urls[0], self.patch)
 
     def action_upload_to_pedal(self) -> None:
         urls = self.patch.get("download_urls", [])
@@ -145,7 +146,7 @@ class DetailScreen(Screen):
             return
         title = _field(self.patch, "title", "patch")
         log.debug("DetailScreen.action_upload_to_pedal: title=%r url=%s", title, urls[0])
-        self.app.start_upload_flow(urls[0], title)
+        self.app.start_upload_flow(urls[0], self.patch)
 
 
 # ── Download-choice modal (for multiple URLs) ─────────────────────────────────
@@ -239,6 +240,71 @@ class SlotInputModal(ModalScreen[int | None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.on_button_pressed(Button.Pressed(self.query_one("#slot-ok", Button)))
+
+    def action_dismiss_none(self) -> None:
+        self.dismiss(None)
+
+
+class PatchFileChoiceModal(ModalScreen["list[Path] | None"]):
+    """Pick one patch file or upload all."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss_none", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    PatchFileChoiceModal {
+        align: center middle;
+    }
+    #pf-box {
+        width: 70;
+        height: auto;
+        max-height: 80%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #pf-box Label {
+        margin-bottom: 1;
+    }
+    #pf-list {
+        height: auto;
+        max-height: 50%;
+        margin-bottom: 1;
+    }
+    #pf-upload-one {
+        width: 1fr;
+    }
+    #pf-upload-all {
+        width: 1fr;
+    }
+    """
+
+    def __init__(self, patch_files: list[Path]) -> None:
+        super().__init__()
+        self.patch_files = patch_files
+
+    def compose(self) -> ComposeResult:
+        with Container(id="pf-box"):
+            yield Label(
+                f"[bold]{len(self.patch_files)} patch files \u2013 pick one or upload all:[/bold]",
+                markup=True,
+            )
+            yield OptionList(*[pf.name for pf in self.patch_files], id="pf-list")
+            with Horizontal(id="pf-buttons"):
+                yield Button("Upload selected", id="pf-upload-one", variant="primary")
+                yield Button("Upload all", id="pf-upload-all", variant="default")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "pf-upload-all":
+            self.dismiss(self.patch_files)
+        else:
+            idx = self.query_one("#pf-list", OptionList).highlighted
+            if idx is not None:
+                self.dismiss([self.patch_files[idx]])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss([self.patch_files[event.option_index]])
 
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
@@ -387,13 +453,12 @@ class BrowserScreen(Screen):
         if not urls:
             self.notify("No download URL for this patch.", severity="warning")
             return
-        title = _field(patch, "title", "patch")
         if len(urls) == 1:
-            self.app.trigger_download(urls[0], title)
+            self.app.trigger_download(urls[0], patch)
         else:
             def _on_pick(idx: int | None) -> None:
                 if idx is not None:
-                    self.app.trigger_download(urls[idx], title)
+                    self.app.trigger_download(urls[idx], patch)
 
             self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
 
@@ -409,11 +474,11 @@ class BrowserScreen(Screen):
         title = _field(patch, "title", "patch")
         log.debug("action_upload_selected: title=%r urls=%d", title, len(urls))
         if len(urls) == 1:
-            self.app.start_upload_flow(urls[0], title)
+            self.app.start_upload_flow(urls[0], patch)
         else:
             def _on_pick(idx: int | None) -> None:
                 if idx is not None:
-                    self.app.start_upload_flow(urls[idx], title)
+                    self.app.start_upload_flow(urls[idx], patch)
 
             self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
 
@@ -492,21 +557,38 @@ class ZoomPatchBrowser(App):
 
     # ── download orchestration ────────────────────────────────────────────────
 
-    def trigger_download(self, url: str, title: str) -> None:
+    @staticmethod
+    def _patch_dir(patch: dict) -> Path:
+        """Return downloads/<id>/ for this patch, creating it if needed."""
+        pid = patch.get("_id", "unknown")
+        dest = DOWNLOAD_DIR / pid
+        dest.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    def trigger_download(self, url: str, patch: dict) -> None:
         """Called from any screen to start a background download."""
-        self._do_download(url, title)
+        self._do_download(url, patch)
 
     @work(thread=True)
-    def _do_download(self, url: str, title: str) -> None:
+    def _do_download(self, url: str, patch: dict) -> None:
         """Background worker: download one patch file."""
         from scraper import ForumScraper
+
+        title = _field(patch, "title", "patch")
+        dest_dir = self._patch_dir(patch)
 
         scraper = ForumScraper()
         scraper.load_cookies()
 
         try:
-            saved = scraper.download_file(url, DOWNLOAD_DIR, title=title)
-            label = f"Extracted → {saved.name}/" if saved.is_dir() else f"Saved → {saved.name}"
+            saved = scraper.download_file(url, dest_dir, title=title)
+            # Extract any archives (ZIP, RAR) the scraper didn't handle
+            self._extract_archives(dest_dir)
+            label = (
+                f"Extracted → {dest_dir.name}/{saved.name}/"
+                if saved.is_dir()
+                else f"Saved → {dest_dir.name}/{saved.name}"
+            )
             self.call_from_thread(
                 self.notify, label, title="Download complete"
             )
@@ -520,25 +602,80 @@ class ZoomPatchBrowser(App):
 
     # ── upload orchestration ──────────────────────────────────────────────────
 
-    def start_upload_flow(self, url: str, title: str) -> None:
-        """Prompt for slot number, then download + upload to pedal."""
+    @staticmethod
+    def _extract_archives(base: Path) -> None:
+        """Extract any ZIP or RAR archives found directly in *base*."""
+        import shutil
+        import subprocess
+        import zipfile
+
+        for arc in list(base.iterdir()):
+            if arc.is_dir():
+                continue
+            # Skip .zg* files — they are patch files (header + embedded ZIP)
+            if arc.suffix.lower().startswith(".zg"):
+                continue
+
+            extracted = False
+
+            # Try ZIP
+            if zipfile.is_zipfile(arc):
+                log.debug("_extract_archives: extracting ZIP %s", arc.name)
+                with zipfile.ZipFile(arc) as zf:
+                    zf.extractall(base)
+                extracted = True
+
+            # Try RAR (use unrar command-line tool)
+            if not extracted and shutil.which("unrar"):
+                try:
+                    # Quick check: is this a RAR file? (magic bytes "Rar!")
+                    with open(arc, "rb") as f:
+                        magic = f.read(7)
+                    if magic[:4] == b"Rar!":
+                        log.debug("_extract_archives: extracting RAR %s", arc.name)
+                        result = subprocess.run(
+                            ["unrar", "x", "-o+", str(arc), str(base) + "/"],
+                            capture_output=True, text=True, timeout=60,
+                        )
+                        if result.returncode == 0:
+                            extracted = True
+                        else:
+                            log.warning("_extract_archives: unrar failed: %s", result.stderr)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    log.warning("_extract_archives: unrar error: %s", exc)
+
+            if extracted:
+                arc.unlink()
+                log.debug("_extract_archives: removed archive %s", arc.name)
+
+    @staticmethod
+    def _find_patch_files(base: Path) -> list[Path]:
+        """Recursively find .zg* and ToneLib.data patch files under *base*."""
+        files: list[Path] = []
+        for pattern in ("**/*.zg*", "**/ToneLib.data"):
+            files.extend(base.glob(pattern))
+        # De-duplicate, deterministic order
+        seen: set[Path] = set()
+        result: list[Path] = []
+        for f in sorted(files):
+            if f not in seen:
+                seen.add(f)
+                result.append(f)
+        return result
+
+    def start_upload_flow(self, url: str, patch: dict) -> None:
+        """Download the patch, then ask for slot (and file if >1), then upload."""
+        title = _field(patch, "title", "patch")
         log.info("start_upload_flow: url=%s title=%r", url, title)
-
-        def _on_slot(slot: int | None) -> None:
-            log.debug("start_upload_flow._on_slot: slot=%r", slot)
-            if slot is not None:
-                self._do_upload(url, title, slot)
-
-        self.push_screen(SlotInputModal(), callback=_on_slot)
+        self._do_upload_download(url, patch)
 
     @work(thread=True)
-    def _do_upload(self, url: str, title: str, slot: int) -> None:
-        """Background worker: download patch then upload to pedal."""
-        import tempfile
+    def _do_upload_download(self, url: str, patch: dict) -> None:
+        """Background worker: download patch into downloads/<id>/ then hand off to UI."""
         from scraper import ForumScraper
-        from zoom_midi import ZoomDevice
 
-        log.info("upload: start — url=%s title=%r slot=%d", url, title, slot)
+        title = _field(patch, "title", "patch")
+        dest_dir = self._patch_dir(patch)
 
         self.call_from_thread(
             self.notify, f"Downloading '{title}'…", title="Upload", timeout=8,
@@ -546,54 +683,100 @@ class ZoomPatchBrowser(App):
 
         scraper = ForumScraper()
         cookies_ok = scraper.load_cookies()
-        log.debug("upload: cookies loaded = %s", cookies_ok)
+        log.debug("upload-dl: cookies loaded = %s", cookies_ok)
         if not cookies_ok:
-            log.warning("upload: no session cookies — download may fail if auth is required")
+            log.warning("upload-dl: no session cookies — download may fail if auth is required")
 
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                saved = scraper.download_file(url, Path(tmpdir), title=title)
-                log.info("upload: downloaded → %s  (is_dir=%s)", saved, saved.is_dir())
+            saved = scraper.download_file(url, dest_dir, title=title)
+            log.info("upload-dl: saved → %s  (is_dir=%s)", saved, saved.is_dir())
 
-                # Find the patch file (.zg* or extracted ToneLib.data)
-                if saved.is_dir():
-                    patch_files = list(saved.glob("*.zg*"))
-                    if not patch_files:
-                        patch_files = list(saved.glob("ToneLib.data"))
-                    if not patch_files:
-                        contents = list(saved.iterdir())
-                        log.error("upload: no patch in extracted dir, contents: %s", contents)
-                        raise RuntimeError(
-                            f"No patch file found in downloaded archive. "
-                            f"Contents: {[c.name for c in contents]}"
-                        )
-                    patch_file = patch_files[0]
-                else:
-                    patch_file = saved
+            # Extract any archives (ZIP, RAR) before scanning for patch files
+            self._extract_archives(dest_dir)
 
-                log.info("upload: patch_file = %s (%d bytes)", patch_file.name, patch_file.stat().st_size)
+            # Collect all patch files under the download directory
+            patch_files = self._find_patch_files(dest_dir)
+            log.info("upload-dl: found %d patch file(s): %s",
+                     len(patch_files), [f.name for f in patch_files])
 
+            if not patch_files:
+                contents = list(dest_dir.rglob("*"))
+                log.error("upload-dl: no patch files in %s, contents: %s",
+                          dest_dir, [c.name for c in contents])
                 self.call_from_thread(
                     self.notify,
-                    f"Sending '{title}' to pedal slot {slot}…",
-                    title="Upload",
-                    timeout=8,
+                    f"No patch files found in download. "
+                    f"Contents: {[c.name for c in contents[:10]]}",
+                    title="Upload error",
+                    severity="error",
+                    timeout=10,
                 )
+                return
 
-                log.debug("upload: opening MIDI device…")
-                with ZoomDevice(debug=self._debug_mode) as dev:
-                    log.debug("upload: device opened at %s", dev.device_path)
-                    name = dev.upload_patch(patch_file, slot)
-                    log.info("upload: success — name=%r slot=%d", name, slot)
+            # Continue on the main thread to show modals
+            self.call_from_thread(self._upload_pick_file_and_slot, patch_files, title)
 
-                self.call_from_thread(
-                    self.notify,
-                    f"'{name}' → slot {slot}",
-                    title="Upload complete",
-                    timeout=8,
-                )
         except Exception as exc:
-            log.exception("upload: FAILED")
+            log.exception("upload-dl: FAILED")
+            self.call_from_thread(
+                self.notify,
+                f"Download failed: {exc}",
+                title="Upload error",
+                severity="error",
+                timeout=15,
+            )
+
+    def _upload_pick_file_and_slot(self, patch_files: list[Path], title: str) -> None:
+        """For a single file go straight to slot prompt; for multiple show the picker."""
+        if len(patch_files) == 1:
+            self._upload_ask_slot(patch_files, title)
+            return
+
+        def _on_choice(chosen: "list[Path] | None") -> None:
+            if chosen:
+                self._upload_ask_slot(chosen, title)
+
+        self.push_screen(PatchFileChoiceModal(patch_files), callback=_on_choice)
+
+    def _upload_ask_slot(self, patch_files: list[Path], title: str) -> None:
+        """Ask for a starting slot then upload each file consecutively."""
+        def _on_slot(slot: int | None) -> None:
+            if slot is not None:
+                for i, pf in enumerate(patch_files):
+                    log.debug("_upload_ask_slot._on_slot: slot=%r file=%s", slot + i, pf.name)
+                    self._do_upload_send(pf, title, slot + i)
+
+        self.push_screen(SlotInputModal(), callback=_on_slot)
+
+    @work(thread=True)
+    def _do_upload_send(self, patch_file: Path, title: str, slot: int) -> None:
+        """Background worker: upload an already-downloaded patch file to pedal."""
+        from zoom_midi import ZoomDevice
+
+        log.info("upload-send: file=%s title=%r slot=%d", patch_file, title, slot)
+
+        self.call_from_thread(
+            self.notify,
+            f"Sending '{title}' to pedal slot {slot}…",
+            title="Upload",
+            timeout=8,
+        )
+
+        try:
+            log.debug("upload-send: opening MIDI device…")
+            with ZoomDevice(debug=self._debug_mode) as dev:
+                log.debug("upload-send: device opened at %s", dev.device_path)
+                name = dev.upload_patch(patch_file, slot)
+                log.info("upload-send: success — name=%r slot=%d", name, slot)
+
+            self.call_from_thread(
+                self.notify,
+                f"'{name}' → slot {slot}",
+                title="Upload complete",
+                timeout=8,
+            )
+        except Exception as exc:
+            log.exception("upload-send: FAILED")
             self.call_from_thread(
                 self.notify,
                 f"Failed: {exc}",
