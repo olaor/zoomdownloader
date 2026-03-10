@@ -493,7 +493,8 @@ class ForumScraper:
                 if chunk:
                     fh.write(chunk)
 
-        if zipfile.is_zipfile(dest):
+        # .zg* patch files are 4-byte header + ZIP — don't extract them
+        if zipfile.is_zipfile(dest) and not dest.suffix.startswith(".zg"):
             folder_name = re.sub(r'[\\/:*?"<>|]', "_", title.strip()) if title.strip() else dest.stem
             extract_dir = dest_dir / folder_name
             extract_dir.mkdir(parents=True, exist_ok=True)

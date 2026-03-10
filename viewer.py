@@ -61,6 +61,7 @@ class DetailScreen(Screen):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape,q", "dismiss", "Back"),
         Binding("d", "download", "Download patch"),
+        Binding("u", "upload_to_pedal", "Upload to pedal"),
     ]
 
     DEFAULT_CSS = """
@@ -134,6 +135,14 @@ class DetailScreen(Screen):
         title = _field(self.patch, "title", "patch")
         self.app.trigger_download(urls[0], title)
 
+    def action_upload_to_pedal(self) -> None:
+        urls = self.patch.get("download_urls", [])
+        if not urls:
+            self.notify("No download URL available for this patch.", severity="warning")
+            return
+        title = _field(self.patch, "title", "patch")
+        self.app.start_upload_flow(urls[0], title)
+
 
 # ── Download-choice modal (for multiple URLs) ─────────────────────────────────
 
@@ -183,6 +192,54 @@ class DownloadChoiceModal(ModalScreen[int | None]):
         self.dismiss(None)
 
 
+class SlotInputModal(ModalScreen[int | None]):
+    """Ask user for a pedal slot number to upload a patch to."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss_none", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    SlotInputModal {
+        align: center middle;
+    }
+    #slot-box {
+        width: 50;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #slot-box Label {
+        margin-bottom: 1;
+    }
+    #slot-input {
+        margin-bottom: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="slot-box"):
+            yield Label("[bold]Upload to pedal slot:[/bold]", markup=True)
+            yield Input(placeholder="Slot number (0–199)", id="slot-input", type="integer")
+            yield Button("Upload", id="slot-ok", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        val = self.query_one("#slot-input", Input).value.strip()
+        if val.isdigit():
+            slot = int(val)
+            if 0 <= slot <= 199:
+                self.dismiss(slot)
+                return
+        self.notify("Enter a slot number between 0 and 199.", severity="warning")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.on_button_pressed(Button.Pressed(self.query_one("#slot-ok", Button)))
+
+    def action_dismiss_none(self) -> None:
+        self.dismiss(None)
+
+
 # ── Main browser screen ───────────────────────────────────────────────────────
 
 class BrowserScreen(Screen):
@@ -194,6 +251,7 @@ class BrowserScreen(Screen):
         Binding("escape", "clear_search", "Clear search", show=False),
         Binding("enter", "view_detail", "Details", show=True),
         Binding("d", "download_selected", "Download", show=True),
+        Binding("u", "upload_selected", "Upload to pedal", show=True),
         Binding("r", "reload", "Reload index", show=False),
     ]
 
@@ -337,6 +395,24 @@ class BrowserScreen(Screen):
 
             asyncio.create_task(_pick())
 
+    def action_upload_selected(self) -> None:
+        patch = self._selected_patch()
+        if patch is None:
+            return
+        urls = patch.get("download_urls", [])
+        if not urls:
+            self.notify("No download URL for this patch.", severity="warning")
+            return
+        title = _field(patch, "title", "patch")
+        if len(urls) == 1:
+            self.app.start_upload_flow(urls[0], title)
+        else:
+            async def _pick() -> None:
+                idx = await self.app.push_screen_wait(DownloadChoiceModal(urls))
+                if idx is not None:
+                    self.app.start_upload_flow(urls[idx], title)
+            asyncio.create_task(_pick())
+
     def action_reload(self) -> None:
         self.reload_data()
         self.notify("Index reloaded.")
@@ -408,6 +484,67 @@ class ZoomPatchBrowser(App):
                 self.notify,
                 f"Failed: {exc}",
                 title="Download error",
+                severity="error",
+            )
+
+    # ── upload orchestration ──────────────────────────────────────────────────
+
+    def start_upload_flow(self, url: str, title: str) -> None:
+        """Prompt for slot number, then download + upload to pedal."""
+        async def _flow() -> None:
+            slot = await self.push_screen_wait(SlotInputModal())
+            if slot is not None:
+                self._do_upload(url, title, slot)
+        asyncio.create_task(_flow())
+
+    @work(thread=True)
+    def _do_upload(self, url: str, title: str, slot: int) -> None:
+        """Background worker: download patch then upload to pedal."""
+        import tempfile
+        from scraper import ForumScraper
+        from zoom_midi import ZoomDevice
+
+        self.call_from_thread(
+            self.notify, f"Downloading patch…", title="Upload"
+        )
+
+        scraper = ForumScraper()
+        scraper.load_cookies()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                saved = scraper.download_file(url, Path(tmpdir), title=title)
+
+                # Find the patch file (.zg* or extracted ToneLib.data)
+                if saved.is_dir():
+                    patch_files = list(saved.glob("*.zg*"))
+                    if not patch_files:
+                        patch_files = list(saved.glob("ToneLib.data"))
+                    if not patch_files:
+                        raise RuntimeError(f"No patch file found in {saved}")
+                    patch_file = patch_files[0]
+                else:
+                    patch_file = saved
+
+                self.call_from_thread(
+                    self.notify,
+                    f"Sending to pedal slot {slot}…",
+                    title="Upload",
+                )
+
+                with ZoomDevice() as dev:
+                    name = dev.upload_patch(patch_file, slot)
+
+                self.call_from_thread(
+                    self.notify,
+                    f"'{name}' → slot {slot}",
+                    title="Upload complete",
+                )
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify,
+                f"Failed: {exc}",
+                title="Upload error",
                 severity="error",
             )
 
