@@ -4,8 +4,8 @@ Run via main.py or directly: python viewer.py
 """
 from __future__ import annotations
 
-import asyncio
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -30,6 +30,9 @@ from textual.widgets import (
 BASE_DIR     = Path(__file__).parent
 INDEX_DIR    = BASE_DIR / "index"
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+DEBUG_DIR    = BASE_DIR / "debug"
+
+log = logging.getLogger("zoomdownloader.browse")
 
 
 # ── data loading ─────────────────────────────────────────────────────────────
@@ -141,6 +144,7 @@ class DetailScreen(Screen):
             self.notify("No download URL available for this patch.", severity="warning")
             return
         title = _field(self.patch, "title", "patch")
+        log.debug("DetailScreen.action_upload_to_pedal: title=%r url=%s", title, urls[0])
         self.app.start_upload_flow(urls[0], title)
 
 
@@ -387,31 +391,31 @@ class BrowserScreen(Screen):
         if len(urls) == 1:
             self.app.trigger_download(urls[0], title)
         else:
-            # Ask user to pick
-            async def _pick() -> None:
-                idx = await self.app.push_screen_wait(DownloadChoiceModal(urls))
+            def _on_pick(idx: int | None) -> None:
                 if idx is not None:
                     self.app.trigger_download(urls[idx], title)
 
-            asyncio.create_task(_pick())
+            self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
 
     def action_upload_selected(self) -> None:
         patch = self._selected_patch()
         if patch is None:
+            log.debug("action_upload_selected: no patch selected")
             return
         urls = patch.get("download_urls", [])
         if not urls:
             self.notify("No download URL for this patch.", severity="warning")
             return
         title = _field(patch, "title", "patch")
+        log.debug("action_upload_selected: title=%r urls=%d", title, len(urls))
         if len(urls) == 1:
             self.app.start_upload_flow(urls[0], title)
         else:
-            async def _pick() -> None:
-                idx = await self.app.push_screen_wait(DownloadChoiceModal(urls))
+            def _on_pick(idx: int | None) -> None:
                 if idx is not None:
                     self.app.start_upload_flow(urls[idx], title)
-            asyncio.create_task(_pick())
+
+            self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
 
     def action_reload(self) -> None:
         self.reload_data()
@@ -430,15 +434,19 @@ class BrowserScreen(Screen):
     def _selected_patch(self) -> dict | None:
         t = self.query_one("#patch-table", DataTable)
         row_key = t.cursor_row
+        log.debug("_selected_patch: cursor_row=%r type=%s  patches=%d",
+                  row_key, type(row_key).__name__, len(self.filtered_patches))
         if row_key is None or not self.filtered_patches:
             return None
         # cursor_row is an integer index in Textual >= 0.45
         try:
             idx = int(str(row_key))
         except (TypeError, ValueError):
+            log.warning("_selected_patch: cannot convert cursor_row %r to int", row_key)
             return None
         if 0 <= idx < len(self.filtered_patches):
             return self.filtered_patches[idx]
+        log.warning("_selected_patch: idx=%d out of range (0..%d)", idx, len(self.filtered_patches) - 1)
         return None
 
 
@@ -456,8 +464,31 @@ class ZoomPatchBrowser(App):
     }
     """
 
+    def __init__(self, debug: bool = False) -> None:
+        super().__init__()
+        self._debug_mode = debug
+        if debug:
+            DEBUG_DIR.mkdir(exist_ok=True)
+            log_path = DEBUG_DIR / "browse.log"
+            handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(name)s  %(message)s")
+            )
+            # Set up root "zoomdownloader" logger so midi module logs go here too
+            root_log = logging.getLogger("zoomdownloader")
+            root_log.setLevel(logging.DEBUG)
+            root_log.addHandler(handler)
+            log.debug("=== browse session started (debug=True) ===")
+            log.debug("log file: %s", log_path)
+
     def on_mount(self) -> None:
         self.push_screen(BrowserScreen())
+        if self._debug_mode:
+            self.notify(
+                "Debug logging → debug/browse.log",
+                title="Debug ON",
+                timeout=6,
+            )
 
     # ── download orchestration ────────────────────────────────────────────────
 
@@ -491,11 +522,14 @@ class ZoomPatchBrowser(App):
 
     def start_upload_flow(self, url: str, title: str) -> None:
         """Prompt for slot number, then download + upload to pedal."""
-        async def _flow() -> None:
-            slot = await self.push_screen_wait(SlotInputModal())
+        log.info("start_upload_flow: url=%s title=%r", url, title)
+
+        def _on_slot(slot: int | None) -> None:
+            log.debug("start_upload_flow._on_slot: slot=%r", slot)
             if slot is not None:
                 self._do_upload(url, title, slot)
-        asyncio.create_task(_flow())
+
+        self.push_screen(SlotInputModal(), callback=_on_slot)
 
     @work(thread=True)
     def _do_upload(self, url: str, title: str, slot: int) -> None:
@@ -504,16 +538,22 @@ class ZoomPatchBrowser(App):
         from scraper import ForumScraper
         from zoom_midi import ZoomDevice
 
+        log.info("upload: start — url=%s title=%r slot=%d", url, title, slot)
+
         self.call_from_thread(
-            self.notify, f"Downloading patch…", title="Upload"
+            self.notify, f"Downloading '{title}'…", title="Upload", timeout=8,
         )
 
         scraper = ForumScraper()
-        scraper.load_cookies()
+        cookies_ok = scraper.load_cookies()
+        log.debug("upload: cookies loaded = %s", cookies_ok)
+        if not cookies_ok:
+            log.warning("upload: no session cookies — download may fail if auth is required")
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 saved = scraper.download_file(url, Path(tmpdir), title=title)
+                log.info("upload: downloaded → %s  (is_dir=%s)", saved, saved.is_dir())
 
                 # Find the patch file (.zg* or extracted ToneLib.data)
                 if saved.is_dir():
@@ -521,31 +561,45 @@ class ZoomPatchBrowser(App):
                     if not patch_files:
                         patch_files = list(saved.glob("ToneLib.data"))
                     if not patch_files:
-                        raise RuntimeError(f"No patch file found in {saved}")
+                        contents = list(saved.iterdir())
+                        log.error("upload: no patch in extracted dir, contents: %s", contents)
+                        raise RuntimeError(
+                            f"No patch file found in downloaded archive. "
+                            f"Contents: {[c.name for c in contents]}"
+                        )
                     patch_file = patch_files[0]
                 else:
                     patch_file = saved
 
+                log.info("upload: patch_file = %s (%d bytes)", patch_file.name, patch_file.stat().st_size)
+
                 self.call_from_thread(
                     self.notify,
-                    f"Sending to pedal slot {slot}…",
+                    f"Sending '{title}' to pedal slot {slot}…",
                     title="Upload",
+                    timeout=8,
                 )
 
-                with ZoomDevice() as dev:
+                log.debug("upload: opening MIDI device…")
+                with ZoomDevice(debug=self._debug_mode) as dev:
+                    log.debug("upload: device opened at %s", dev.device_path)
                     name = dev.upload_patch(patch_file, slot)
+                    log.info("upload: success — name=%r slot=%d", name, slot)
 
                 self.call_from_thread(
                     self.notify,
                     f"'{name}' → slot {slot}",
                     title="Upload complete",
+                    timeout=8,
                 )
         except Exception as exc:
+            log.exception("upload: FAILED")
             self.call_from_thread(
                 self.notify,
                 f"Failed: {exc}",
                 title="Upload error",
                 severity="error",
+                timeout=15,
             )
 
 

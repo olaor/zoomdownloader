@@ -22,10 +22,10 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     scraper.scrape(force=args.force)
 
 
-def cmd_browse(_args: argparse.Namespace) -> None:
+def cmd_browse(args: argparse.Namespace) -> None:
     from viewer import ZoomPatchBrowser
 
-    ZoomPatchBrowser().run()
+    ZoomPatchBrowser(debug=getattr(args, "debug", False)).run()
 
 
 def cmd_upload(args: argparse.Namespace) -> None:
@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # browse
     bp = sub.add_parser("browse", help="Open TUI browser for indexed patches")
+    bp.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging to debug/browse.log during browse.",
+    )
     bp.set_defaults(func=cmd_browse)
 
     # upload

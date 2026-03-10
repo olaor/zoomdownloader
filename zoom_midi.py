@@ -8,12 +8,15 @@ and confirmed against a real G3Xn pedal.
 from __future__ import annotations
 
 import binascii
+import logging
 import os
 import struct
 import xml.etree.ElementTree as ET
 import zipfile
 from io import BytesIO
 from pathlib import Path
+
+log = logging.getLogger("zoomdownloader.midi")
 
 
 # ── Protocol constants ───────────────────────────────────────────────────────
@@ -182,10 +185,18 @@ def find_amidi_port() -> str | None:
 class ZoomDevice:
     """Communicate with a Zoom G3n/G3Xn/G5n pedal via ALSA raw MIDI."""
 
-    def __init__(self, device_path: str | None = None, device_id: int = 0x6E):
+    def __init__(self, device_path: str | None = None, device_id: int = 0x6E,
+                 debug: bool = False):
         self.device_id = device_id
         self.device_path = device_path or find_midi_device()
         self._fd: int | None = None
+        if debug:
+            log.setLevel(logging.DEBUG)
+            # Ensure at least one handler if the browse logger hasn't set one up
+            if not log.handlers and not log.parent.handlers:
+                h = logging.StreamHandler()
+                h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                log.addHandler(h)
 
     def open(self) -> None:
         if self._fd is not None:
@@ -194,6 +205,7 @@ class ZoomDevice:
             raise RuntimeError(
                 "No Zoom MIDI device found. Is your pedal connected via USB?"
             )
+        log.debug("MIDI open %s", self.device_path)
         self._fd = os.open(self.device_path, os.O_RDWR | os.O_NONBLOCK)
 
     def close(self) -> None:
@@ -211,7 +223,9 @@ class ZoomDevice:
     def _write(self, data: bytes | bytearray | list) -> None:
         if self._fd is None:
             raise RuntimeError("Device not open")
-        os.write(self._fd, bytes(data))
+        raw = bytes(data)
+        log.debug("MIDI TX (%d bytes): %s", len(raw), raw.hex(" "))
+        os.write(self._fd, raw)
 
     def _read(self, timeout: float = 2.0) -> bytes:
         """Read one complete SysEx message (F0 ... F7) with timeout."""
@@ -232,8 +246,13 @@ class ZoomDevice:
             if SYSEX_END in buf:
                 # Find the complete SysEx
                 end_idx = buf.index(SYSEX_END)
-                return bytes(buf[:end_idx + 1])
+                result = bytes(buf[:end_idx + 1])
+                log.debug("MIDI RX (%d bytes): %s", len(result),
+                          result[:64].hex(" ") + ("…" if len(result) > 64 else ""))
+                return result
 
+        log.warning("MIDI RX timeout (%.1fs) — got %d bytes: %s",
+                    timeout, len(buf), buf[:64].hex(" ") if buf else "(empty)")
         return bytes(buf)
 
     # ── High-level commands ──────────────────────────────────────────────────
@@ -293,11 +312,21 @@ class ZoomDevice:
 
     def pc_mode_on(self) -> bytes:
         """Enable PC mode (required for persistent patch read/write)."""
+        log.debug("pc_mode_on: sending CMD_PC_MODE_ON (0x%02X)", CMD_PC_MODE_ON)
         self._write(self._sysex(CMD_PC_MODE_ON))
-        return self._read(timeout=2.0)
+        resp = self._read(timeout=2.0)
+        if not resp:
+            raise RuntimeError("pc_mode_on: no response from pedal (timeout)")
+        if SYSEX_END not in resp:
+            raise RuntimeError(
+                f"pc_mode_on: incomplete response ({len(resp)} bytes)"
+            )
+        log.debug("pc_mode_on: OK (%d bytes)", len(resp))
+        return resp
 
     def pc_mode_off(self) -> None:
         """Disable PC mode."""
+        log.debug("pc_mode_off")
         self._write(self._sysex(CMD_PC_MODE_OFF))
 
     def patch_check(self) -> tuple[int, int, int]:
@@ -308,8 +337,11 @@ class ZoomDevice:
           - psize: patch data size in bytes
           - bsize: patches per bank
         """
+        log.debug("patch_check: sending CMD_PATCH_CHECK (0x%02X)", CMD_PATCH_CHECK)
         self._write(self._sysex(CMD_PATCH_CHECK))
         resp = self._read(timeout=2.0)
+        if not resp:
+            raise RuntimeError("patch_check: no response from pedal (timeout)")
         # Response: F0 52 00 6E 43 <data...> F7
         # mido-style offsets (skip F0): [4]=count_lo, [5]=count_hi, etc.
         d = resp[1:-1]  # strip F0 and F7
@@ -318,6 +350,11 @@ class ZoomDevice:
         count = d[4] + d[5] * 128
         psize = d[6] + d[7] * 128
         bsize = d[10] + d[11] * 128
+        log.info("patch_check: count=%d psize=%d bsize=%d", count, psize, bsize)
+        if bsize == 0:
+            raise RuntimeError(
+                f"patch_check: invalid bsize=0 (count={count} psize={psize})"
+            )
         return count, psize, bsize
 
     def _slot_to_bank_loc(self, slot: int, bsize: int) -> tuple[int, int]:
@@ -334,6 +371,8 @@ class ZoomDevice:
         """
         bank, loc = self._slot_to_bank_loc(slot, bsize)
         length = len(ptcf_data)
+        log.info("write_patch_to_slot: slot=%d → bank=%d loc=%d  length=%d",
+                 slot, bank, loc, length)
 
         # Build packet body (without F0/F7)
         packet = bytearray([ZOOM_MFR_ID, 0x00, self.device_id, CMD_PATCH_UPLOAD, 0x00, 0x00])
@@ -348,6 +387,8 @@ class ZoomDevice:
 
         # CRC32 checksum (inverted, split into 7-bit bytes)
         crc = binascii.crc32(ptcf_data) ^ 0xFFFFFFFF
+        log.debug("write_patch_to_slot: CRC32=0x%08X  packet=%d bytes",
+                  crc ^ 0xFFFFFFFF, len(packet) + 2)
         packet.append(crc & 0x7F)
         packet.append((crc >> 7) & 0x7F)
         packet.append((crc >> 14) & 0x7F)
@@ -356,7 +397,13 @@ class ZoomDevice:
 
         msg = bytes([SYSEX_START]) + bytes(packet) + bytes([SYSEX_END])
         self._write(msg)
-        self._read(timeout=5.0)  # wait for acknowledgment
+        resp = self._read(timeout=5.0)  # wait for acknowledgment
+        if not resp:
+            raise RuntimeError(
+                "write_patch_to_slot: no acknowledgment from pedal (timeout) — "
+                "patch may not have been saved"
+            )
+        log.debug("write_patch_to_slot: ack received (%d bytes)", len(resp))
 
     def upload_patch(self, patch_path: str | Path, slot: int) -> str:
         """
@@ -370,7 +417,10 @@ class ZoomDevice:
 
         Returns the patch name from the PTCF data.
         """
+        log.info("upload_patch: file=%s slot=%d", patch_path, slot)
         ptcf_data = parse_patch_file(patch_path)
+        log.debug("upload_patch: parsed PTCF — %d bytes, header: %s",
+                  len(ptcf_data), ptcf_data[:8].hex(" "))
 
         if len(ptcf_data) != PTCF_SIZE:
             raise ValueError(
@@ -379,6 +429,7 @@ class ZoomDevice:
 
         name_bytes = ptcf_data[26:37]
         name = bytes(b for b in name_bytes if b >= 0x20 and b <= 0x7E).decode("ascii", errors="replace").strip()
+        log.info("upload_patch: patch name = %r", name)
 
         self.pc_mode_on()
         try:
@@ -387,6 +438,7 @@ class ZoomDevice:
         finally:
             self.pc_mode_off()
 
+        log.info("upload_patch: complete — '%s' → slot %d", name, slot)
         return name
 
 
