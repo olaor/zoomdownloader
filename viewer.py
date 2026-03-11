@@ -237,17 +237,20 @@ class SlotInputModal(ModalScreen[int | None]):
     def compose(self) -> ComposeResult:
         with Container(id="slot-box"):
             yield Label("[bold]Upload to pedal slot:[/bold]", markup=True)
-            yield Input(placeholder="Slot number (1–200)", id="slot-input", type="integer")
+            yield Input(placeholder="Slot 1–200  (blank = active slot)", id="slot-input", type="integer")
             yield Button("Upload", id="slot-ok", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         val = self.query_one("#slot-input", Input).value.strip()
+        if val == "":
+            self.dismiss(0)  # 0 = sentinel: use currently active slot
+            return
         if val.isdigit():
             slot = int(val)
             if 1 <= slot <= 200:
                 self.dismiss(slot)
                 return
-        self.notify("Enter a slot number between 1 and 200.", severity="warning")
+        self.notify("Enter a slot number between 1 and 200, or leave blank for the active slot.", severity="warning")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.on_button_pressed(Button.Pressed(self.query_one("#slot-ok", Button)))
@@ -839,13 +842,52 @@ class ZoomPatchBrowser(App):
     def _upload_ask_slot(self, patch_files: list[Path], title: str) -> None:
         """Ask for a starting slot then upload each file consecutively."""
         def _on_slot(slot: int | None) -> None:
-            if slot is not None:
+            if slot is None:
+                return  # cancelled
+            if slot == 0:  # sentinel: upload to the currently active pedal slot
+                self._do_upload_send_current(patch_files, title)
+            else:
                 for i, pf in enumerate(patch_files):
                     internal_slot = slot - 1 + i  # user sees 1-based, pedal uses 0-based
                     log.debug("_upload_ask_slot._on_slot: slot=%r file=%s", slot + i, pf.name)
                     self._do_upload_send(pf, title, internal_slot)
 
         self.push_screen(SlotInputModal(), callback=_on_slot)
+
+    @work(thread=True)
+    def _do_upload_send_current(self, patch_files: list[Path], title: str) -> None:
+        """Background worker: resolve the active pedal slot then upload patch(es) starting there."""
+        from zoom_midi import ZoomDevice
+
+        self.call_from_thread(self.notify, "Querying active slot…", title="Upload", timeout=4)
+
+        try:
+            with ZoomDevice(debug=self._debug_mode) as dev:
+                current_slot = dev.get_current_slot()
+        except Exception as exc:
+            log.exception("_do_upload_send_current: device query failed")
+            self.call_from_thread(
+                self.notify,
+                f"Failed to query pedal: {exc}",
+                title="Upload error",
+                severity="error",
+                timeout=15,
+            )
+            return
+
+        if current_slot is None:
+            self.call_from_thread(
+                self.notify,
+                "Could not determine the active slot from the pedal.",
+                title="Upload error",
+                severity="error",
+                timeout=10,
+            )
+            return
+
+        log.info("_do_upload_send_current: active slot = %d", current_slot)
+        for i, pf in enumerate(patch_files):
+            self._do_upload_send(pf, title, current_slot + i)
 
     @work(thread=True)
     def _do_upload_send(self, patch_file: Path, title: str, slot: int) -> None:

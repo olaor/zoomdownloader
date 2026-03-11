@@ -77,6 +77,8 @@ zoomdownloader          # browse is the default when no sub-command is given
 | `Esc` | Clear search / close detail view |
 | `Enter` | Open detail view |
 | `d` | Download the selected patch file |
+| `u` | Upload selected patch to the pedal |
+| `t` | Test selected patch on the pedal (temporary, non-destructive) |
 | `r` | Reload index from disk |
 | `q` | Quit |
 
@@ -87,6 +89,13 @@ zoomdownloader browse --debug    # enable debug logging to debug/browse.log
 ```
 
 ### Upload a patch to the pedal
+
+From the TUI browser, select a patch and press `u`. You will be prompted for a
+target slot number (1–200). **Leave the field blank and press Enter to upload to
+the currently active slot on the pedal** — no need to remember which number you
+are on.
+
+You can also upload directly from the command line:
 
 ```bash
 zoomdownloader upload PATH/TO/PATCH.zg3xn SLOT

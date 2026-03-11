@@ -400,10 +400,64 @@ class ZoomDevice:
                  slot, bank, loc, bsize)
         return slot
 
-    def pc_mode_off(self) -> None:
-        """Disable PC mode."""
+    def _parse_slot_from_patch_dump(self, resp: bytes) -> int | None:
+        """
+        Extract the currently-active slot from a spontaneous CMD_PATCH_UPLOAD
+        (0x45) state-dump packet the pedal emits when leaving PC mode.
+
+        Packet layout (bytes, 0-indexed, including F0/F7 wrapper):
+          [0]      F0
+          [1..3]   52 00 6E      (Zoom manufacturer ID + device ID)
+          [4]      0x45          (CMD_PATCH_UPLOAD)
+          [5..6]   00 00         (reserved)
+          [7]      bank_lo
+          [8]      bank_hi
+          [9]      loc_lo        (1-based location within bank)
+          [10]     loc_hi
+          [11..12] len_lo/hi     (PTCF length, e.g. 736 bytes → 0x60 0x05)
+          [13+]    7-bit-encoded PTCF data
+          [-1]     F7
+
+        Returns the 0-based slot index, or None on failure.
+        """
+        if len(resp) < 13 or resp[4] != CMD_PATCH_UPLOAD:
+            log.debug("_parse_slot_from_patch_dump: not a 0x45 packet (len=%d cmd=0x%02X)",
+                      len(resp), resp[4] if len(resp) > 4 else 0)
+            return None
+        bank = resp[7] + resp[8] * 128
+        loc  = resp[9] + resp[10] * 128   # 0-based within bank (same as write side)
+        bsize = 3                          # G3n/G3Xn default
+        slot = bank * bsize + loc
+        if not (0 <= slot < 200):
+            log.warning("_parse_slot_from_patch_dump: slot=%d out of range "
+                        "(bank=%d loc=%d bsize=%d)", slot, bank, loc, bsize)
+            return None
+        log.info("_parse_slot_from_patch_dump: bank=%d loc=%d(0-based) bsize=%d → slot=%d",
+                 bank, loc, bsize, slot)
+        return slot
+
+    def get_current_slot(self) -> int | None:
+        """
+        Query the currently-active slot by entering then immediately leaving PC
+        mode.  Uses the exact same pc_mode_on()/pc_mode_off() pair as
+        upload_patch(): when the pedal exits PC mode it always emits a
+        CMD_PATCH_UPLOAD (0x45) state-dump packet that encodes the active bank
+        and location.
+
+        Returns the 0-based slot index, or None if it cannot be determined.
+        """
+        log.debug("get_current_slot: entering PC mode")
+        self.pc_mode_on()
+        dump = self.pc_mode_off()
+        return self._parse_slot_from_patch_dump(dump)
+
+    def pc_mode_off(self) -> bytes:
+        """Disable PC mode and return the state-dump response from the pedal."""
         log.debug("pc_mode_off")
         self._write(self._sysex(CMD_PC_MODE_OFF))
+        resp = self._read(timeout=2.0)
+        self._drain()
+        return resp
 
     def patch_check(self) -> tuple[int, int, int]:
         """
