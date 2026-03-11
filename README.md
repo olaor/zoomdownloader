@@ -26,6 +26,10 @@ from the [Tonelib community forum](https://tonelib.net/forums/forums/zoom-g3n-g3
 - **G5n patch compatibility**: G5n patches (8–9 effect slots) are automatically adapted for the G3n/G3Xn firmware (7-slot limit) on upload — no skipping, no crashes
 - **Group padding**: when a group has fewer patches than the 3-slot bank size, the leftover slot is automatically cleared on the pedal so no stale patch is left behind
 
+## Screenshots
+
+See the [screenshots gallery](docs/screenshots/README.md) for a visual tour of the TUI.
+
 ## Installation
 
 ### pip (recommended)
