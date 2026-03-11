@@ -3,6 +3,17 @@
 Scrape, browse, and upload guitar effect patches for the **Zoom G3n / G3Xn / G5n**
 from the [Tonelib community forum](https://tonelib.net/forums/forums/zoom-g3n-g3xn-g5n.15/).
 
+> [!WARNING]
+> **No warranty. Use at your own risk.**
+>
+> This software is provided as-is with **no warranties of any kind**. There are known,
+> unresolved bugs that can cause the pedal to crash so severely that it requires a
+> **factory reset**, which will **erase all installed patches**.
+>
+> **Back up your pedal before use.** If you have a carefully curated set of patches
+> on your pedal, use [ToneLib-Zoom](https://tonelib.net/) to create a full backup
+> before running this tool. A factory reset cannot be undone.
+
 ## Features
 
 - Crawls every page of the forum and indexes all threads as JSON files
