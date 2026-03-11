@@ -48,6 +48,79 @@ CMD_PATCH_DOWNLOAD = 0x46
 CMD_PROGRAM_CHANGE = 0xC0
 
 PTCF_SIZE = 736  # G3n/G3Xn/G5n patch data size
+G3XN_MAX_EFFECTS = 7   # G3n/G3Xn firmware supports at most 7 simultaneous effects
+EDTB_BYTES_PER_EFFECT = 24  # each EDTB entry is exactly 24 bytes
+
+
+# ── G3Xn PTCF compatibility ─────────────────────────────────────────────────
+
+def clamp_ptcf_effects_for_g3xn(ptcf_data: bytes) -> bytes:
+    """Limit the effect count to G3XN_MAX_EFFECTS (7) for G3n/G3Xn compatibility.
+
+    G5n patches can declare 8 or 9 effect slots; the G3n/G3Xn firmware only
+    handles 7.  Writing a patch with more slots causes the firmware to reject
+    the write (ACK error 0x03) or crash at pc_mode_off.
+
+    The PTCF layout when n_effects > G3XN_MAX_EFFECTS:
+
+      bytes  0–39   : fixed header
+      bytes 40–N    : effect slot ID table, (n_effects - 1) × 4 bytes each
+      bytes N+4 ..  : TXJ1 / TXE1 / EDTB / PPRM blocks
+
+    G3Xn expects exactly (G3XN_MAX_EFFECTS - 1) = 6 table entries, with TXJ1
+    starting at byte 64.  Extra table entries must be removed and the blocks
+    that follow shifted left to fill the gap.
+
+    Three fields are updated:
+      • byte[12..16]  num_effects (LE32)        → G3XN_MAX_EFFECTS
+      • effect table  (bytes 40..N)             → keep only first 6 entries
+      • EDTB size                               → G3XN_MAX_EFFECTS × 24
+    """
+    if len(ptcf_data) < 16 or ptcf_data[:4] != b"PTCF":
+        return ptcf_data  # not a recognised PTCF — pass through unchanged
+
+    num_effects = struct.unpack_from("<I", ptcf_data, 12)[0]
+    if num_effects <= G3XN_MAX_EFFECTS:
+        return ptcf_data  # already compatible, nothing to do
+
+    # Effect table: starts at byte 40, (num_effects - 1) * 4 bytes
+    # G3Xn expects: (G3XN_MAX_EFFECTS - 1) * 4 bytes
+    table_start = 40
+    orig_entries = num_effects - 1
+    want_entries = G3XN_MAX_EFFECTS - 1
+    orig_table_end = table_start + orig_entries * 4
+    want_table_end = table_start + want_entries * 4
+    trim = orig_table_end - want_table_end   # bytes to remove
+
+    log.info(
+        "clamp_ptcf_effects_for_g3xn: clamping effect count %d → %d "
+        "(G5n patch detected; removing %d excess effect table bytes)",
+        num_effects, G3XN_MAX_EFFECTS, trim,
+    )
+
+    # Build new PTCF: header + truncated effect table + rest of blocks
+    data = bytearray(ptcf_data[:want_table_end])    # header + 6 entries
+    data.extend(ptcf_data[orig_table_end:])          # TXJ1 / TXE1 / EDTB / ...
+    # Re-pad to original length so PTCF size stays 736
+    if len(data) < len(ptcf_data):
+        data.extend(b"\x00" * (len(ptcf_data) - len(data)))
+    data = data[:len(ptcf_data)]
+
+    # Update num_effects
+    struct.pack_into("<I", data, 12, G3XN_MAX_EFFECTS)
+
+    # Update the EDTB block size
+    edtb_pos = bytes(data).find(b"EDTB")
+    if edtb_pos >= 0:
+        old_size = struct.unpack_from("<I", data, edtb_pos + 4)[0]
+        new_size = G3XN_MAX_EFFECTS * EDTB_BYTES_PER_EFFECT
+        log.debug(
+            "clamp_ptcf_effects_for_g3xn: EDTB @%d  size %d → %d",
+            edtb_pos, old_size, new_size,
+        )
+        struct.pack_into("<I", data, edtb_pos + 4, new_size)
+
+    return bytes(data)
 
 
 # ── 7-bit MIDI encoding/decoding ────────────────────────────────────────────
@@ -452,10 +525,26 @@ class ZoomDevice:
         return self._parse_slot_from_patch_dump(dump)
 
     def pc_mode_off(self) -> bytes:
-        """Disable PC mode and return the state-dump response from the pedal."""
+        """Disable PC mode and return the state-dump response from the pedal.
+
+        When exiting PC mode the pedal validates and commits every modified
+        slot before it responds.  This is proportional to the number and
+        complexity of the patches just written — notably, patches containing
+        effect module IDs that are unfamiliar to the firmware take noticeably
+        longer to process.  Use a generous timeout so we never abandon the
+        pedal mid-commit (which leaves it stuck in PC mode and requiring a
+        factory reset).
+        """
         log.debug("pc_mode_off")
         self._write(self._sysex(CMD_PC_MODE_OFF))
-        resp = self._read(timeout=2.0)
+        resp = self._read(timeout=60.0)
+        if not resp:
+            raise RuntimeError(
+                "pc_mode_off: pedal did not exit PC mode within 60 s — "
+                "the pedal appears stuck. Power-cycle it to recover. "
+                "If this keeps happening, one or more patches may contain "
+                "effect modules that are not supported by your pedal firmware."
+            )
         self._drain()
         return resp
 
@@ -567,9 +656,16 @@ class ZoomDevice:
         self.pc_mode_on()
         try:
             _count, psize, bsize = self.patch_check()
-            if len(ptcf_data) < psize:
-                ptcf_data = ptcf_data + b"\x00" * (psize - len(ptcf_data))
-                log.debug("upload_patch: padded PTCF to %d bytes", psize)
+            ptcf_len = len(ptcf_data)
+            if ptcf_len < psize:
+                ptcf_data = ptcf_data + b"\x00" * (psize - ptcf_len)
+                log.debug("upload_patch: padded PTCF from %d to %d bytes", ptcf_len, psize)
+            elif ptcf_len > psize:
+                raise ValueError(
+                    f"PTCF is {ptcf_len} bytes but pedal expects {psize} bytes "
+                    f"\u2014 refusing to upload oversized patch data."
+                )
+            ptcf_data = clamp_ptcf_effects_for_g3xn(ptcf_data)
             self.write_patch_to_slot(slot, ptcf_data, bsize)
         finally:
             self.pc_mode_off()
