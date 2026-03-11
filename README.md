@@ -20,7 +20,8 @@ from the [Tonelib community forum](https://tonelib.net/forums/forums/zoom-g3n-g3
 - Extracts structured metadata: device, firmware, name on device, optimized for, patch comments, forum URL, and download links
 - Saves session cookie so you only need to log in once
 - Terminal UI browser with arrow-key navigation, live search, detail view, and one-key patch download
-- **Favourites** tab: curate a personal set of patches, organize them into named groups, reorder freely, and upload the whole collection to the pedal in one operation
+- **Preferences** (`p`): set your pedal model (G3n, G3Xn, G3Xn+G3n, or G5n) and firmware version, then enable filtering so only patches made for your hardware are shown
+- **Favourites** tab: curate a personal set of patches, organize them into named groups, reorder freely, and upload the whole collection to the pedal in one operation — each favourite entry shows the target pedal model and firmware at a glance
 - Uploads patches directly to the pedal via USB/MIDI SysEx (`upload` command)
 - **G5n patch compatibility**: G5n patches (8–9 effect slots) are automatically adapted for the G3n/G3Xn firmware (7-slot limit) on upload — no skipping, no crashes
 - **Group padding**: when a group has fewer patches than the 3-slot bank size, the leftover slot is automatically cleared on the pedal so no stale patch is left behind
@@ -95,7 +96,22 @@ zoomdownloader          # browse is the default when no sub-command is given
 | `t` | Test selected patch on the pedal (temporary, non-destructive) |
 | `f` | Add/remove patch from Favourites |
 | `r` | Reload index from disk |
+| `p` | Open Preferences (pedal model, firmware, filter toggle) |
 | `q` | Quit |
+
+The patch list columns are: **Title**, **Name on device**, **Device**, **Firmware**, **Optimized for**, **DL** (download count), and **★** (favourited).
+
+### Preferences
+
+Press `p` to open the Preferences dialog:
+
+- **Pedal model** — choose from G3n, G3Xn, G3Xn + G3n (both), or G5n
+- **Firmware version** — enter your firmware (e.g. `2.20`); leave blank to match any
+- **Filter toggle** — when checked, the patch list shows only patches whose `device` and `firmware` fields match your selection
+
+When `G3Xn + G3n` is selected, patches tagged for either model are shown together.
+
+Preferences are saved to `~/.zoomdownloader/prefs.json`.
 
 ### Favourites
 
@@ -106,14 +122,17 @@ Patches can be organised into named groups.
 |-----|--------|
 | `f` | Add selected patch to Favourites (from All Patches tab) |
 | `f` | Remove patch from Favourites (from Favourites tab) |
+| `Enter` | Open detail view for selected favourite |
 | `n` | New group |
 | `r` | Rename selected group |
 | `m` | Move patch into a group / make standalone |
-| `c` | Clear all Favourites |
+| `c` | Copy patch to a group |
 | `u` | Upload all Favourites to the pedal (bank-aligned) |
 | `Shift+↑` / `Shift+↓` | Reorder patches (move into/out of adjacent groups) |
 
-Favourites are saved to `~/.zoomdownloader/config/favourites.json`.
+Each entry in the Favourites list shows the patch title alongside its **pedal model** and **firmware** (e.g. `• JOLA LEAD  G3Xn  fw 2.10`), so you can see at a glance which hardware a patch targets.
+
+Favourites are saved to `~/.zoomdownloader/favourites.json`.
 
 Downloaded files are saved to `~/.zoomdownloader/downloads/`.
 
@@ -152,7 +171,8 @@ zoomdownloader upload ~/Downloads/crunch.zg3xn 5
 | `~/.zoomdownloader/downloads/` | Downloaded `.zg*` patch files |
 | `~/.zoomdownloader/config/cookies.json` | Session cookie |
 | `~/.zoomdownloader/config/credentials.json` | Saved login credentials |
-| `~/.zoomdownloader/config/favourites.json` | Favourites collection (patches + groups) |
+| `~/.zoomdownloader/favourites.json` | Favourites collection (patches + groups) |
+| `~/.zoomdownloader/prefs.json` | Preferences (pedal model, firmware, filter toggle) |
 
 ## Project layout
 

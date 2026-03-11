@@ -20,6 +20,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
     Button,
+    Checkbox,
     ContentSwitcher,
     DataTable,
     Footer,
@@ -29,6 +30,7 @@ from textual.widgets import (
     ListItem,
     ListView,
     OptionList,
+    Select,
     Static,
 )
 
@@ -38,8 +40,129 @@ INDEX_DIR       = APP_DIR / "index"
 DOWNLOAD_DIR    = APP_DIR / "downloads"
 DEBUG_DIR       = BASE_DIR / "debug"
 FAVOURITES_FILE = APP_DIR / "favourites.json"
+PREFS_FILE      = APP_DIR / "prefs.json"
+
+PEDAL_MODELS: list[tuple[str, str]] = [
+    ("G3n",          "G3n"),
+    ("G3Xn",         "G3Xn"),
+    ("G3Xn + G3n",   "G3Xn+G3n"),
+    ("G5n",          "G5n"),
+]
+
+# When filtering by a model key, which device-field substrings to accept.
+# Keys are the *values* stored in prefs.json (second element of PEDAL_MODELS tuples).
+_PEDAL_MATCH: dict[str, list[str]] = {
+    "G3n":               ["g3n"],
+    "G3Xn":              ["g3xn"],
+    "G3Xn+G3n":          ["g3xn", "g3n"],
+    "G3Xn + G3n (both)": ["g3xn", "g3n"],  # compat: old prefs written before fix
+    "G5n":               ["g5n"],
+}
 
 log = logging.getLogger("zoomdownloader.browse")
+
+
+# ── Preferences persistence ───────────────────────────────────────────────────
+
+def load_prefs() -> dict:
+    if not PREFS_FILE.exists():
+        return {}
+    try:
+        return json.loads(PREFS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_prefs(prefs: dict) -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    PREFS_FILE.write_text(json.dumps(prefs, indent=2))
+
+
+# ── Preferences modal ────────────────────────────────────────────────────────
+
+class PreferencesModal(ModalScreen[dict | None]):
+    """Preferences dialog: pedal model, firmware version, and patch filter."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss_cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    PreferencesModal { align: center middle; }
+    #prefs-box {
+        width: 64;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #prefs-box Label.section-label { margin-top: 1; color: $text-muted; }
+    #prefs-box Label.heading { margin-bottom: 1; }
+    #prefs-pedal  { margin-bottom: 1; }
+    #prefs-firmware { margin-bottom: 1; }
+    #prefs-filter { margin-bottom: 1; }
+    #prefs-buttons { margin-top: 1; height: auto; }
+    #prefs-save   { width: 1fr; }
+    #prefs-cancel { width: 1fr; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="prefs-box"):
+            yield Label("[bold]Preferences[/bold]", markup=True, classes="heading")
+            yield Label("My pedal model:", classes="section-label")
+            yield Select(
+                PEDAL_MODELS,
+                id="prefs-pedal",
+                allow_blank=True,
+                prompt="(any / not set)",
+            )
+            yield Label("Firmware version:", classes="section-label")
+            yield Input(
+                placeholder="e.g. 2.10  (leave blank to match any)",
+                id="prefs-firmware",
+            )
+            yield Checkbox(
+                "Show only patches made for my pedal & firmware",
+                id="prefs-filter",
+            )
+            with Horizontal(id="prefs-buttons"):
+                yield Button("Save", id="prefs-save", variant="primary")
+                yield Button("Cancel", id="prefs-cancel")
+
+    def on_mount(self) -> None:
+        prefs = load_prefs()
+        pedal    = prefs.get("pedal", "")
+        firmware = prefs.get("firmware", "")
+        do_filter = prefs.get("filter", False)
+
+        sel = self.query_one("#prefs-pedal", Select)
+        if pedal:
+            sel.value = pedal
+
+        self.query_one("#prefs-firmware", Input).value = firmware
+        self.query_one("#prefs-filter", Checkbox).value = do_filter
+        self.query_one("#prefs-firmware", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "prefs-cancel":
+            self.dismiss(None)
+            return
+        self._save_and_dismiss()
+
+    def on_input_submitted(self, _event: Input.Submitted) -> None:
+        self._save_and_dismiss()
+
+    def _save_and_dismiss(self) -> None:
+        sel = self.query_one("#prefs-pedal", Select)
+        pedal    = "" if sel.value is Select.BLANK else str(sel.value)
+        firmware = self.query_one("#prefs-firmware", Input).value.strip()
+        do_filter = bool(self.query_one("#prefs-filter", Checkbox).value)
+        prefs = {"pedal": pedal, "firmware": firmware, "filter": do_filter}
+        save_prefs(prefs)
+        self.dismiss(prefs)
+
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ── data loading ─────────────────────────────────────────────────────────────
@@ -637,8 +760,15 @@ class PatchFavItem(ListItem):
         self.patch_idx = patch_idx
 
     def compose(self) -> ComposeResult:
-        prefix = "\u00b7" if self.patch_idx is not None else "\u2022"
-        yield Static(f"{prefix} {self.patch_data.get('title', 'Untitled')}")
+        prefix  = "\u00b7" if self.patch_idx is not None else "\u2022"
+        title   = self.patch_data.get("title", "Untitled")
+        device  = self.patch_data.get("device", "").strip()
+        fw      = self.patch_data.get("firmware", "").strip()
+        meta    = "  ".join(part for part in [device, (f"fw {fw}" if fw else "")] if part)
+        line    = f"{prefix} {title}"
+        if meta:
+            line += f"  [dim]{meta}[/dim]"
+        yield Static(line, markup=True)
 
 
 # ── Favourites panel ──────────────────────────────────────────────────────────
@@ -653,6 +783,7 @@ class FavouritesPanel(Widget):
     CAN_FOCUS = True
 
     BINDINGS: ClassVar[list[Binding]] = [
+        Binding("enter",      "view_detail",     "Details",         show=True),
         Binding("shift+up",   "move_up",        "Move up"),
         Binding("shift+down", "move_down",       "Move down"),
         Binding("f",          "unfavourite",     "Remove fav"),
@@ -694,7 +825,36 @@ class FavouritesPanel(Widget):
 
     def reload(self) -> None:
         self._items = load_favourites()
+        self._enrich_items(self._items)
         self._refresh_list()
+
+    @staticmethod
+    def _enrich_items(items: list[dict]) -> None:
+        """Fill in missing device/firmware on fav entries by reading the index."""
+        def _enrich_patch(entry: dict) -> None:
+            if entry.get("device") and entry.get("firmware"):
+                return  # already populated
+            pid = entry.get("id", "")
+            if not pid:
+                return
+            p = INDEX_DIR / f"{pid}.json"
+            if not p.exists():
+                return
+            try:
+                data = json.loads(p.read_text())
+                if not entry.get("device"):
+                    entry["device"] = data.get("device", "").strip()
+                if not entry.get("firmware"):
+                    entry["firmware"] = data.get("firmware", "").strip()
+            except Exception:
+                pass
+
+        for item in items:
+            if _item_is_patch(item):
+                _enrich_patch(item)
+            elif _item_is_group(item):
+                for p in item.get("patches", []):
+                    _enrich_patch(p)
 
     def _total_items(self) -> int:
         total = 0
@@ -998,25 +1158,32 @@ class FavouritesPanel(Widget):
 
     # ── detail navigation ─────────────────────────────────────────────────────
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if isinstance(event.item, PatchFavItem):
-            patch = self.app.find_patch_by_id(event.item.patch_data.get("id", ""))
+    def action_view_detail(self) -> None:
+        row = self._current_item()
+        if isinstance(row, PatchFavItem):
+            patch = self.app.find_patch_by_id(row.patch_data.get("id", ""))
             if patch:
                 self.app.push_screen(DetailScreen(patch))
             else:
                 self.notify(
-                    f"Patch \u2018{event.item.patch_data.get('title', '?')}\u2019 not in local index.",
+                    f"Patch \u2018{row.patch_data.get('title', '?')}\u2019 not in local index.",
                     severity="warning",
                 )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, PatchFavItem):
+            self.action_view_detail()
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def add_patch(self, patch: dict) -> None:
         """Add as a standalone favourite instantly — no dialog."""
         patch_entry = {
-            "id":    patch.get("_id", ""),
-            "title": _field(patch, "title", "Untitled"),
-            "url":   (patch.get("download_urls") or [""])[0],
+            "id":       patch.get("_id", ""),
+            "title":    _field(patch, "title", "Untitled"),
+            "url":      (patch.get("download_urls") or [""])[0],
+            "device":   patch.get("device", "").strip(),
+            "firmware": patch.get("firmware", "").strip(),
         }
         if patch_entry["id"] and patch_entry["id"] in get_all_fav_ids(self._items):
             self.notify("Already in favourites.", severity="warning")
@@ -1042,6 +1209,7 @@ class BrowserScreen(Screen):
         Binding("t",          "test_selected",      "Test patch",        show=True),
         Binding("f",          "favourite_selected", "Favourite",         show=True),
         Binding("r",          "reload",             "Reload index",      show=True),
+        Binding("p",          "preferences",        "Preferences",       show=True),
     ]
 
     DEFAULT_CSS = """
@@ -1098,11 +1266,43 @@ class BrowserScreen(Screen):
 
     def _build_columns(self) -> None:
         t = self.query_one("#patch-table", DataTable)
-        t.add_columns("Title", "Device", "Firmware", "Optimized for", "DL", "★")
+        t.add_columns("Title", "Name on device", "Device", "Firmware", "Optimized for", "DL", "★")
 
     def reload_data(self) -> None:
         self.all_patches = load_patches()
-        self.filtered_patches = list(self.all_patches)
+        q = self.query_one("#search-input", Input).value
+        self._refilter(q)
+
+    def _refilter(self, query: str = "") -> None:
+        """Apply prefs filter then text search; update filtered_patches and table."""
+        prefs = load_prefs()
+        if prefs.get("filter"):
+            pedal    = prefs.get("pedal", "").strip()
+            fw       = prefs.get("firmware", "").lower().strip()
+            keywords = _PEDAL_MATCH.get(pedal, [pedal.lower()] if pedal else [])
+            base = [
+                p for p in self.all_patches
+                if (not keywords or any(kw in p.get("device", "").lower() for kw in keywords))
+                and (not fw      or fw in p.get("firmware", "").lower())
+            ]
+        else:
+            base = self.all_patches
+
+        q = query.lower().strip()
+        if not q:
+            self.filtered_patches = list(base)
+        else:
+            self.filtered_patches = [
+                p for p in base
+                if q in " ".join([
+                    p.get("title", ""),
+                    p.get("device", ""),
+                    p.get("firmware", ""),
+                    p.get("optimized_for", ""),
+                    p.get("name_on_device", ""),
+                    p.get("patch_comments", ""),
+                ]).lower()
+            ]
         self._refresh_table()
 
     def _refresh_table(self) -> None:
@@ -1116,6 +1316,7 @@ class BrowserScreen(Screen):
             star = Text("★", style="bold yellow") if p.get("_id", "") in fav_ids else Text("")
             t.add_row(
                 _field(p, "title"),
+                _field(p, "name_on_device"),
                 _field(p, "device"),
                 _field(p, "firmware"),
                 _field(p, "optimized_for"),
@@ -1132,14 +1333,21 @@ class BrowserScreen(Screen):
         status = self.query_one("#status-bar", Static)
         total = len(self.all_patches)
         shown = len(self.filtered_patches)
+        prefs = load_prefs()
+        filter_active = prefs.get("filter", False)
+        filter_tag = ""
+        if filter_active:
+            pedal = prefs.get("pedal", "") or "any"
+            fw    = prefs.get("firmware", "") or "any"
+            filter_tag = f"  [dim cyan][filter: {pedal} / fw {fw}][/dim cyan]"
         if total == 0:
             status.update(
                 "[yellow]No patches indexed yet. Run:[/yellow] [bold]python main.py scrape[/bold]"
             )
         elif shown == total:
-            status.update(f"{total} patches")
+            status.update(f"{total} patches{filter_tag}")
         else:
-            status.update(f"{shown} of {total} patches match")
+            status.update(f"{shown} of {total} patches match{filter_tag}")
 
     # ── tab switching ─────────────────────────────────────────────────────────
 
@@ -1198,26 +1406,7 @@ class BrowserScreen(Screen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "search-input":
             return
-        q = event.value.lower().strip()
-        if not q:
-            self.filtered_patches = list(self.all_patches)
-        else:
-            self.filtered_patches = [
-                p
-                for p in self.all_patches
-                if q
-                in " ".join(
-                    [
-                        p.get("title", ""),
-                        p.get("device", ""),
-                        p.get("firmware", ""),
-                        p.get("optimized_for", ""),
-                        p.get("name_on_device", ""),
-                        p.get("patch_comments", ""),
-                    ]
-                ).lower()
-            ]
-        self._refresh_table()
+        self._refilter(event.value)
 
     # ── key actions ──────────────────────────────────────────────────────────
 
@@ -1290,6 +1479,23 @@ class BrowserScreen(Screen):
                     self.app.start_test_flow(urls[idx], patch)
 
             self.app.push_screen(DownloadChoiceModal(urls), callback=_on_pick)
+
+    def action_preferences(self) -> None:
+        def _on_close(prefs: dict | None) -> None:
+            if prefs is not None:
+                q = self.query_one("#search-input", Input).value
+                self._refilter(q)
+                pedal = prefs.get("pedal", "") or "any"
+                fw    = prefs.get("firmware", "") or "any"
+                if prefs.get("filter"):
+                    self.notify(
+                        f"Filtering to {pedal} / firmware {fw}.",
+                        title="Preferences saved",
+                    )
+                else:
+                    self.notify("Showing all patches.", title="Preferences saved")
+
+        self.app.push_screen(PreferencesModal(), callback=_on_close)
 
     def action_reload(self) -> None:
         self.reload_data()
