@@ -1909,7 +1909,8 @@ class ZoomPatchBrowser(App):
         from scraper import ForumScraper
         from zoom_midi import ZoomDevice, parse_patch_file, clamp_ptcf_effects_for_g3xn
 
-        actual = [(s, p) for s, p in layout if p is not None]
+        actual        = [(s, p) for s, p in layout if p is not None]
+        padding_slots = [s for s, p in layout if p is None]
         total  = len(actual)
         done   = 0
         errors: list[str] = []
@@ -1959,6 +1960,7 @@ class ZoomPatchBrowser(App):
                 try:
                     _count, psize, bsize = dev.patch_check()
                     n = len(resolved)
+                    blank_template: bytes | None = None
                     for i, (slot, patch_file, title) in enumerate(resolved):
                         self.call_from_thread(
                             self.notify,
@@ -1984,9 +1986,29 @@ class ZoomPatchBrowser(App):
                             dev.write_patch_to_slot(slot, ptcf_data, bsize)
                             done += 1
                             log.info("fav-upload: \u2018%s\u2019 \u2192 slot %d", name, slot + 1)
+                            if blank_template is None:
+                                blank_template = ptcf_data  # save as template for padding slots
                         except Exception as exc:
                             log.exception("fav-upload: FAILED for \u2018%s\u2019", title)
                             errors.append(f"\u2022 {title}: {exc}")
+
+                    # Clear padding slots (group bank remainder) using the first
+                    # successfully-uploaded PTCF as a structural template, with
+                    # its name blanked.  We cannot read slots back from the device
+                    # in PC mode (cmd 0x09 returns only a short ACK in that mode).
+                    for slot in padding_slots:
+                        if blank_template is None:
+                            log.warning("fav-upload: no template PTCF — cannot clear padding slot %d", slot + 1)
+                            errors.append(f"\u2022 Slot {slot + 1} (padding): no template patch available")
+                            continue
+                        try:
+                            blank = bytearray(blank_template)
+                            blank[26:37] = b"           "  # 11-byte name field → spaces
+                            dev.write_patch_to_slot(slot, bytes(blank), bsize)
+                            log.info("fav-upload: cleared padding slot %d", slot + 1)
+                        except Exception as exc:
+                            log.exception("fav-upload: FAILED to clear padding slot %d", slot + 1)
+                            errors.append(f"\u2022 Slot {slot + 1} (padding): {exc}")
                 finally:
                     dev.pc_mode_off()
         except Exception as exc:
